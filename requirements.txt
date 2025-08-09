@@ -1,7 +1,11 @@
 streamlit
+selenium
+beautifulsoup4
 pandas
+lxml
+scipy
 numpy
 xgboost
 scikit-learn
-openpyxl
-beautifulsoup4
+webdriver-manager
+
