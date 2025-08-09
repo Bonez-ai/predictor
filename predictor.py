@@ -1,66 +1,47 @@
-
-# app.py
-# Football Predictor — BetExplorer + Poisson + XGBoost
-# deps: streamlit selenium webdriver-manager bs4 pandas numpy scipy xgboost scikit-learn openpyxl
-
+# app.py — Streamlit Cloud friendly (requests-based)
 import re, time, datetime
 from io import BytesIO
-from urllib.parse import urljoin
-from contextlib import contextmanager
+from urllib.parse import urljoin, urlparse
+from collections import defaultdict
 
 import numpy as np
 import pandas as pd
+import requests
 import streamlit as st
 from bs4 import BeautifulSoup
 from scipy.stats import poisson
-
-# Selenium + webdriver-manager
-from selenium import webdriver
-from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.chrome.service import Service
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
-from webdriver_manager.chrome import ChromeDriverManager
 
 # ML
 import xgboost as xgb
 from sklearn.preprocessing import LabelEncoder
 
-# ────────────────────────────────────────────────────────────────────────────────
-# UI
-# ────────────────────────────────────────────────────────────────────────────────
-st.set_page_config(page_title="Bonez Bookz Predictor", layout="wide")
-st.title("⚽ Bonez Bookz Predictor")
+# ─────────────────────────── UI & session ───────────────────────────
+st.set_page_config(page_title="Football Predictor — BetExplorer + Poisson + XGBoost", layout="wide")
+st.title("⚽ Football Predictor — BetExplorer + Poisson + XGBoost")
 
-# session state
 if 'predictions' not in st.session_state: st.session_state.predictions = []
 if 'scraped_df'  not in st.session_state: st.session_state.scraped_df  = pd.DataFrame()
 if 'trained_models' not in st.session_state: st.session_state.trained_models = None
 
-# leagues
 LEAGUES = {
-    "england":"England Premier League","england2":"England Championship","england3":"England League One",
-    "england4":"England League Two","england5":"England National League",
+    "england":"England Premier League","england2":"England Championship","england3":"England League One","england4":"England League Two",
     "spain":"Spain La Liga","spain2":"Spain Segunda División",
     "germany":"Germany Bundesliga",
     "italy":"Italy Serie A","italy2":"Italy Serie B",
-    "france":"France Ligue 1","france2":"France Ligue 2","france3":"France National",
+    "france":"France Ligue 1","france2":"France Ligue 2",
     "netherlands":"Netherlands Eredivisie","netherlands2":"Netherlands Eerste Divisie",
-    "portugal":"Portugal Primeira Liga","portugal2":"Portugal Segunda Liga",
-    "belgium":"Belgium Pro League","belgium2":"Belgium Challenger Pro League",
+    "portugal":"Portugal Primeira Liga","portugal2":"Portugal Liga Portugal 2",
+    "belgium":"Belgium Jupiler Pro League","belgium2":"Belgium Challenger Pro League",
     "switzerland":"Switzerland Super League","switzerland2":"Switzerland Challenge League",
     "austria":"Austria Bundesliga","austria2":"Austria 2. Liga",
     "denmark":"Denmark Superliga","denmark2":"Denmark 1st Division",
-    "sweden":"Sweden Allsvenskan","sweden2":"Sweden Superettan","sweden3":"Sweden Ettan",
+    "sweden":"Sweden Allsvenskan","sweden2":"Sweden Superettan",
     "norway":"Norway Eliteserien","norway2":"Norway 1. Division",
-    "finland":"Finland Veikkausliiga","finland2":"Finland Ykkönen",
     "scotland":"Scotland Premiership","scotland2":"Scotland Championship",
-    "turkey":"Turkey Süper Lig","greece":"Greece Super League",
-    "brazil":"Brazil Série A","brazil2":"Brazil Série B",
-    "argentina":"Argentina Primera División",
-    "usa":"USA MLS","japan":"Japan J1 League"
+    "turkey":"Turkey Süper Lig","turkey2":"Turkey 1. Lig",
+    "spainB":"Spain Segunda División"
 }
+
 PREVIOUS_SEASONS = {
     "Belgium Jupiler Pro League 2024–2025": "https://www.betexplorer.com/football/belgium/jupiler-pro-league-2024-2025/results/",
     "Belgium Challenger Pro League 2024–2025": "https://www.betexplorer.com/football/belgium/challenger-pro-league-2024-2025/results/",
@@ -85,172 +66,120 @@ PREVIOUS_SEASONS = {
     "Switzerland Super League 2024–2025": "https://www.betexplorer.com/football/switzerland/super-league-2024-2025/results/",
     "Switzerland Challenge League 2024–2025": "https://www.betexplorer.com/football/switzerland/challenge-league-2024-2025/results/",
     "Turkey Super Lig 2024–2025": "https://www.betexplorer.com/football/turkey/super-lig-2024-2025/results/",
-    "Turkey 1. Lig 2024–2025": "https://www.betexplorer.com/football/turkey/1-lig-2024-2025/results/"
+    "Turkey 1. Lig 2024–2025": "https://www.betexplorer.com/football/turkey/1-lig-2024-2025/results/",
 }
 
-# ────────────────────────────────────────────────────────────────────────────────
-# Selenium helpers — FRESH driver per call (no caching)
-# ────────────────────────────────────────────────────────────────────────────────
-def _make_driver(headless: bool = True):
-    opts = Options()
-    # If headless is flaky, switch to: opts.add_argument("--headless") or comment out to see the window.
-    if headless:
-        opts.add_argument("--headless=new")
-    opts.add_argument("--no-sandbox")
-    opts.add_argument("--disable-dev-shm-usage")
-    opts.add_argument("--window-size=1400,2200")
-    opts.add_argument("--user-agent=Mozilla/5.0")
-    service = Service(ChromeDriverManager().install())  # auto-match your Chrome
-    return webdriver.Chrome(service=service, options=opts)
+# ─────────────────────────── Requests helper ───────────────────────────
+USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123 Safari/537.36"
 
-@contextmanager
-def chrome(headless: bool = True):
-    d = _make_driver(headless=headless)
-    try:
-        yield d
-    finally:
-        try:
-            d.quit()
-        except Exception:
-            pass
+def get_soup(url: str) -> BeautifulSoup:
+    """GET with retries + UA; return BeautifulSoup(lxml)."""
+    sess = requests.Session()
+    sess.headers.update({"User-Agent": USER_AGENT, "Accept-Language": "en-US,en;q=0.8"})
+    for attempt in range(4):
+        r = sess.get(url, timeout=20)
+        if r.status_code == 200 and r.text:
+            return BeautifulSoup(r.text, "lxml")
+        time.sleep(1.2 * (attempt + 1))
+    raise RuntimeError(f"Failed to fetch {url} (status={r.status_code})")
 
 def _normalize_text(s: str) -> str:
-    s = (s or "").strip().lower()
-    try: s = s.encode("ascii", "ignore").decode()
-    except Exception: pass
-    return s
+    return (s or "").encode("ascii","ignore").decode().strip().lower()
 
 def _country_slug_from_key(key: str) -> str:
-    base = re.sub(r"\d+", "", key.lower())
+    base = re.sub(r"\d+","", key.lower())
     special = {"southkorea":"south-korea","southafrica":"south-africa","hongkong":"hong-kong",
                "elsalvador":"el-salvador","saudiarabia":"saudi-arabia","usa":"usa"}
     return special.get(base, base)
-
-def _clean_text(el): return "" if el is None else " ".join(el.get_text(strip=True).split())
 
 def _ensure_results(url: str) -> str:
     if not url.endswith("/"): url += "/"
     if "results/" not in url: url = urljoin(url, "results/")
     return url
 
-# DO NOT cache: this uses Selenium
+@st.cache_data(show_spinner="Finding league URL…", ttl=3600)
 def find_league_results_url(country_key: str, pretty_name: str) -> str:
     slug = _country_slug_from_key(country_key)
     base = f"https://www.betexplorer.com/football/{slug}/"
-    with chrome() as d:
-        d.get(base)
-        # Cookie accept (best effort)
-        for sel in [
-            (By.CSS_SELECTOR, "button#onetrust-accept-btn-handler"),
-            (By.XPATH, "//button[contains(., 'Accept')]"),
-            (By.XPATH, "//button[contains(., 'I accept')]"),
-        ]:
-            try:
-                WebDriverWait(d, 3).until(EC.element_to_be_clickable(sel)).click()
-                break
-            except Exception:
-                pass
-        WebDriverWait(d, 15).until(EC.presence_of_element_located((By.CSS_SELECTOR, "a")))
-        soup = BeautifulSoup(d.page_source, "html.parser")
+    soup = get_soup(base)
 
     target = _normalize_text(pretty_name)
     best_href, best_score = None, -1
     for a in soup.select("a[href]"):
-        t = _clean_text(a)
-        if not t: continue
-        score = sum(1 for tok in target.split() if tok and tok in _normalize_text(t))
+        t = _normalize_text(a.get_text(" ", strip=True))
+        if not t: 
+            continue
+        # simple token overlap scoring
+        score = sum(1 for tok in target.split() if tok and tok in t)
         if score > best_score:
             best_score, best_href = score, a.get("href")
 
     if not best_href:
-        raise RuntimeError(f"Could not find league link for {pretty_name} at {base}")
+        raise RuntimeError(f"Could not find league link for {pretty_name} on {base}")
 
     league_url = urljoin(base, best_href if best_href.endswith("/") else best_href + "/")
     return _ensure_results(league_url)
 
-# Cache only the DATA (safe)
 @st.cache_data(show_spinner="Scraping match data…", ttl=3600)
 def scrape_results_page(url: str) -> pd.DataFrame:
-    with chrome() as d:
-        d.get(url)
-        # Cookie accept
-        for sel in [
-            (By.CSS_SELECTOR, "button#onetrust-accept-btn-handler"),
-            (By.XPATH, "//button[contains(., 'Accept')]"),
-            (By.XPATH, "//button[contains(., 'I accept')]"),
-        ]:
-            try:
-                WebDriverWait(d, 3).until(EC.element_to_be_clickable(sel)).click()
-                break
-            except Exception:
-                pass
-        WebDriverWait(d, 15).until(EC.presence_of_element_located((By.CSS_SELECTOR, "tr")))
-
-        # Load older results if present
-        for _ in range(6):
-            try:
-                btn = WebDriverWait(d, 3).until(
-                    EC.element_to_be_clickable((By.XPATH, "//a[contains(@class,'js-show-more') or contains(., 'Show more')]"))
-                )
-                d.execute_script("arguments[0].click();", btn)
-                time.sleep(1.2)
-            except Exception:
-                break
-
-        html = d.page_source
-
-    soup = BeautifulSoup(html, "html.parser")
+    """Parse BetExplorer results page into a dataframe. (No Selenium)"""
+    soup = get_soup(url)
     rows = []
-    for tr in soup.select("tr"):
-        teams_link = tr.select_one("td.h-text-left a.in-match")
-        score_link = tr.select_one("td.h-text-center a")
-        if not teams_link or not score_link: continue
-        score_text = _clean_text(score_link)
-        if not re.search(r"^\d+\s*:\s*\d+$", score_text): continue
 
-        teams_text = _clean_text(teams_link)
+    # BetExplorer lists results within <tr> rows; same structure as with Selenium version
+    for tr in soup.select("tr"):
+        a_match = tr.select_one("td.h-text-left a.in-match")
+        a_score = tr.select_one("td.h-text-center a")
+        if not a_match or not a_score:
+            continue
+
+        score_text = a_score.get_text(strip=True)
+        if not re.fullmatch(r"\d+\s*:\s*\d+", score_text):
+            continue
+
+        teams_text = a_match.get_text(" ", strip=True)
         if " - " in teams_text:
             home, away = [t.strip() for t in teams_text.split(" - ", 1)]
         else:
-            spans = teams_link.select("span")
-            if len(spans) >= 2: home, away = _clean_text(spans[0]), _clean_text(spans[-1])
-            else: continue
+            spans = a_match.select("span")
+            if len(spans) >= 2:
+                home, away = spans[0].get_text(strip=True), spans[-1].get_text(strip=True)
+            else:
+                continue
 
         hg, ag = [int(x) for x in score_text.replace(" ", "").split(":")]
+        res = "Home Win" if hg > ag else "Away Win" if ag > hg else "Draw"
+
         rows.append({
-            "Home Team": home, "Away Team": away,
-            "Home Score": hg, "Away Score": ag,
-            "Result": "Home Win" if hg > ag else "Away Win" if ag > hg else "Draw"
+            "Home Team": home,
+            "Away Team": away,
+            "Home Score": hg,
+            "Away Score": ag,
+            "Result": res
         })
 
     return pd.DataFrame(rows)
 
-# ────────────────────────────────────────────────────────────────────────────────
-# Features & Models
-# ────────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────── Features & Models ───────────────────────────
 def calculate_team_strengths(df: pd.DataFrame):
     stats = {}
     if df.empty: return stats
     lg_h = df['Home Score'].mean() or 1.0
     lg_a = df['Away Score'].mean() or 1.0
-    teams = set(df['Home Team']).union(df['Away Team'])
-    for t in teams:
-        h = df[df['Home Team'] == t]
-        a = df[df['Away Team'] == t]
-        atk_h = (h['Home Score'].mean() / lg_h) if len(h) else 1.0
-        def_h = (h['Away Score'].mean() / lg_a) if len(h) else 1.0
-        atk_a = (a['Away Score'].mean() / lg_a) if len(a) else 1.0
-        def_a = (a['Home Score'].mean() / lg_h) if len(a) else 1.0
-        stats[t] = {
-            'attack': float(np.nan_to_num((atk_h + atk_a) / 2.0)),
-            'defense': float(np.nan_to_num((def_h + def_a) / 2.0)),
-        }
+    for t in set(df['Home Team']).union(df['Away Team']):
+        h = df[df['Home Team']==t]; a = df[df['Away Team']==t]
+        atk_h = (h['Home Score'].mean()/lg_h) if len(h) else 1.0
+        def_h = (h['Away Score'].mean()/lg_a) if len(h) else 1.0
+        atk_a = (a['Away Score'].mean()/lg_a) if len(a) else 1.0
+        def_a = (a['Home Score'].mean()/lg_h) if len(a) else 1.0
+        stats[t] = {'attack': float(np.nan_to_num((atk_h+atk_a)/2.0)),
+                    'defense': float(np.nan_to_num((def_h+def_a)/2.0))}
     return stats
 
 def create_features(df: pd.DataFrame):
     df = df.copy()
     df['Total Goals'] = df['Home Score'] + df['Away Score']
-    df['BTTS'] = ((df['Home Score'] > 0) & (df['Away Score'] > 0)).astype(int)
+    df['BTTS'] = ((df['Home Score']>0) & (df['Away Score']>0)).astype(int)
     stats = calculate_team_strengths(df)
     df['Home_Attack']  = df['Home Team'].apply(lambda x: stats.get(x,{}).get('attack',0.0))
     df['Home_Defense'] = df['Home Team'].apply(lambda x: stats.get(x,{}).get('defense',0.0))
@@ -342,7 +271,6 @@ def poisson_verdict(h,d,a):
     if a > h and a > 0.45: return "2"
     return "1X2"
 
-# league table
 def league_table(df):
     tbl = {}
     for _,r in df.iterrows():
@@ -361,13 +289,11 @@ def league_table(df):
     df_tab.rename(columns={"index":"Team"}, inplace=True)
     return df_tab
 
-# ────────────────────────────────────────────────────────────────────────────────
-# STEP 1: Scrape
-# ────────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────── UI — Step 1 ───────────────────────────
 st.header("1) Scrape Data from BetExplorer")
-scrape_type = st.radio("Season Type", ["Current Season","Previous Season"], horizontal=True)
+mode = st.radio("Season Type", ["Current Season","Previous Season"], horizontal=True)
 
-if scrape_type=="Current Season":
+if mode=="Current Season":
     league_name = st.selectbox("Select Current League", list(LEAGUES.values()))
     code = [k for k,v in LEAGUES.items() if v==league_name][0]
     if st.button("🔎 Scrape Current Season Data"):
@@ -394,20 +320,9 @@ else:
         except Exception as e:
             st.error(f"Scrape error: {e}")
 
-# Optional sanity button
-if st.button("🧪 Test WebDriver"):
-    try:
-        with chrome(headless=False) as d:
-            ver = d.capabilities.get("browserVersion")
-        st.success(f"WebDriver OK — Chrome {ver}")
-    except Exception as e:
-        st.error(f"WebDriver failed: {e}")
-
 st.divider()
 
-# ────────────────────────────────────────────────────────────────────────────────
-# STEP 2: Train
-# ────────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────── UI — Step 2 ───────────────────────────
 st.header("2) Train Prediction Models")
 if not st.session_state.scraped_df.empty:
     st.info(f"Dataset size: {len(st.session_state.scraped_df)} matches.")
@@ -422,9 +337,7 @@ else:
 
 st.divider()
 
-# ────────────────────────────────────────────────────────────────────────────────
-# STEP 3: Predict
-# ────────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────── UI — Step 3 ───────────────────────────
 st.header("3) Make Predictions")
 if st.session_state.trained_models is not None:
     df = st.session_state.scraped_df
