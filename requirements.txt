@@ -8,4 +8,9 @@ numpy
 xgboost
 scikit-learn
 webdriver-manager
+pandas
+numpy
+joblib
+openpyxl
+
 
